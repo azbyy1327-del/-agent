@@ -1,528 +1,500 @@
-# -*- coding: utf-8 -*-
-"""
-营销数据分析 Agent
-功能：
-1. 读取营销投放 CSV 数据
-2. 自动清洗字段
-3. 计算核心营销指标
-4. 支持中文问题分析
-5. 输出自动化营销报告
-
-运行方式：
-python marketing_data_agent.py --file sample_marketing_data.csv
-
-依赖：
-pip install pandas duckdb numpy tabulate
-"""
-
-import os
-import re
-import sys
-import json
-import math
-import argparse
-from datetime import datetime, timedelta
-
-import numpy as np
+import streamlit as st
 import pandas as pd
-import duckdb
-from tabulate import tabulate
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from typing import Dict, List, Optional
 
+st.set_page_config(page_title="营销数据分析 Agent", layout="wide")
 
+# =========================
+# 工具函数
+# =========================
+def safe_divide(a, b):
+    return np.where((b == 0) | (pd.isna(b)), 0, a / b)
+
+def format_number(x):
+    try:
+        return f"{x:,.2f}"
+    except:
+        return x
+
+# =========================
+# Agent 主类
+# =========================
 class MarketingDataAgent:
-    REQUIRED_COLUMNS = [
-        "date",
-        "channel",
-        "campaign",
-        "impressions",
-        "clicks",
-        "cost",
-        "conversions",
-        "revenue"
-    ]
-
-    COLUMN_ALIASES = {
-        "日期": "date",
-        "时间": "date",
-        "渠道": "channel",
-        "来源": "channel",
-        "平台": "channel",
-        "广告系列": "campaign",
-        "计划": "campaign",
-        "活动": "campaign",
-        "曝光": "impressions",
-        "展示": "impressions",
-        "展示量": "impressions",
-        "点击": "clicks",
-        "点击量": "clicks",
-        "花费": "cost",
-        "消耗": "cost",
-        "转化": "conversions",
-        "转化数": "conversions",
-        "订单": "conversions",
-        "收入": "revenue",
-        "销售额": "revenue",
-        "GMV": "revenue"
-    }
-
-    def __init__(self, file_path: str):
-        self.file_path = file_path
+    def __init__(self):
         self.df = None
-        self.conn = duckdb.connect(database=":memory:")
-        self.load_and_prepare()
+        self.standard_columns = {
+            "date": ["date", "日期", "day", "投放日期", "时间"],
+            "channel": ["channel", "渠道", "source", "media", "平台"],
+            "campaign": ["campaign", "计划", "campaign_name", "广告计划", "活动"],
+            "impressions": ["impressions", "曝光", "曝光量", "展示", "展示量"],
+            "clicks": ["clicks", "点击", "点击量"],
+            "cost": ["cost", "花费", "消耗", "spend", "广告花费"],
+            "conversions": ["conversions", "转化", "转化数", "订单数", "leads"],
+            "revenue": ["revenue", "收入", "成交金额", "gmv", "销售额"]
+        }
 
-    # ----------------------------
-    # 数据加载与清洗
-    # ----------------------------
-    def load_and_prepare(self):
-        if not os.path.exists(self.file_path):
-            raise FileNotFoundError(f"文件不存在: {self.file_path}")
+    def load_data(self, file) -> pd.DataFrame:
+        try:
+            df = pd.read_csv(file)
+        except:
+            df = pd.read_excel(file)
 
-        df = pd.read_csv(self.file_path)
-
-        # 字段名标准化
-        df.columns = [self.normalize_column_name(c) for c in df.columns]
-
-        # 别名映射
-        rename_map = {}
-        for c in df.columns:
-            if c in self.COLUMN_ALIASES:
-                rename_map[c] = self.COLUMN_ALIASES[c]
-        df = df.rename(columns=rename_map)
-
-        missing_cols = [c for c in self.REQUIRED_COLUMNS if c not in df.columns]
-        if missing_cols:
-            raise ValueError(f"缺少必要字段: {missing_cols}")
-
-        # 类型处理
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        for col in ["impressions", "clicks", "cost", "conversions", "revenue"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-        df["channel"] = df["channel"].astype(str).fillna("Unknown")
-        df["campaign"] = df["campaign"].astype(str).fillna("Unknown")
-
-        # 去掉日期为空的数据
-        df = df.dropna(subset=["date"]).copy()
-
-        # 去重
-        df = df.drop_duplicates().reset_index(drop=True)
-
-        # 衍生指标
-        df["ctr"] = np.where(df["impressions"] > 0, df["clicks"] / df["impressions"], 0.0)
-        df["cpc"] = np.where(df["clicks"] > 0, df["cost"] / df["clicks"], 0.0)
-        df["cvr"] = np.where(df["clicks"] > 0, df["conversions"] / df["clicks"], 0.0)
-        df["cpa"] = np.where(df["conversions"] > 0, df["cost"] / df["conversions"], 0.0)
-        df["roas"] = np.where(df["cost"] > 0, df["revenue"] / df["cost"], 0.0)
+        df = self._standardize_columns(df)
+        df = self._clean_data(df)
+        df = self._calculate_metrics(df)
 
         self.df = df
-        self.conn.register("marketing_data", self.df)
+        return df
 
-    @staticmethod
-    def normalize_column_name(col):
-        return str(col).strip().lower()
+    def _standardize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        columns_lower = {col: str(col).strip().lower() for col in df.columns}
+        reverse_map = {}
 
-    # ----------------------------
-    # 指标计算
-    # ----------------------------
-    def overall_summary(self):
-        d = self.df
-        impressions = d["impressions"].sum()
-        clicks = d["clicks"].sum()
-        cost = d["cost"].sum()
-        conversions = d["conversions"].sum()
-        revenue = d["revenue"].sum()
+        for std_col, aliases in self.standard_columns.items():
+            for original_col, lower_col in columns_lower.items():
+                if lower_col in [a.lower() for a in aliases]:
+                    reverse_map[original_col] = std_col
+                    break
 
-        result = {
-            "总曝光": int(impressions),
-            "总点击": int(clicks),
-            "总花费": round(cost, 2),
-            "总转化": int(conversions),
-            "总收入": round(revenue, 2),
-            "CTR": self.safe_div(clicks, impressions),
-            "CPC": self.safe_div(cost, clicks),
-            "CVR": self.safe_div(conversions, clicks),
-            "CPA": self.safe_div(cost, conversions),
-            "ROAS": self.safe_div(revenue, cost),
-        }
-        return result
+        df = df.rename(columns=reverse_map)
+        return df
 
-    @staticmethod
-    def safe_div(a, b):
-        if b == 0:
-            return 0.0
-        return a / b
+    def _clean_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        # 日期处理
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-    @staticmethod
-    def fmt_pct(v):
-        return f"{v * 100:.2f}%"
+        # 数值字段处理
+        numeric_cols = ["impressions", "clicks", "cost", "conversions", "revenue"]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    @staticmethod
-    def fmt_num(v):
-        if isinstance(v, (int, np.integer)):
-            return f"{v}"
-        return f"{v:.2f}"
+        # 文本字段处理
+        text_cols = ["channel", "campaign"]
+        for col in text_cols:
+            if col in df.columns:
+                df[col] = df[col].fillna("未知").astype(str)
 
-    # ----------------------------
-    # 自动报告
-    # ----------------------------
-    def generate_report(self):
-        summary = self.overall_summary()
-        by_channel = self.group_analysis("channel")
-        by_campaign = self.group_analysis("campaign")
-        trend = self.daily_trend(last_n=7)
-        anomalies = self.find_inefficient_campaigns()
+        # 去重
+        df = df.drop_duplicates()
 
-        lines = []
-        lines.append("==== 营销数据分析报告 ====")
-        lines.append("")
-        lines.append("【1. 整体表现】")
-        lines.append(
-            f"总曝光 {summary['总曝光']}，总点击 {summary['总点击']}，总花费 {summary['总花费']:.2f}，"
-            f"总转化 {summary['总转化']}，总收入 {summary['总收入']:.2f}"
-        )
-        lines.append(
-            f"CTR {self.fmt_pct(summary['CTR'])}，CPC {summary['CPC']:.2f}，"
-            f"CVR {self.fmt_pct(summary['CVR'])}，CPA {summary['CPA']:.2f}，ROAS {summary['ROAS']:.2f}"
-        )
-        lines.append("")
+        return df
 
-        lines.append("【2. 渠道表现 TOP】")
-        top_channels = by_channel.sort_values("revenue", ascending=False).head(5)
-        for _, r in top_channels.iterrows():
-            lines.append(
-                f"- {r['channel']}: 花费 {r['cost']:.2f}，收入 {r['revenue']:.2f}，"
-                f"ROAS {r['roas']:.2f}，CTR {self.fmt_pct(r['ctr'])}，CVR {self.fmt_pct(r['cvr'])}"
-            )
-        lines.append("")
-
-        lines.append("【3. Campaign 表现 TOP】")
-        top_campaigns = by_campaign.sort_values("roas", ascending=False).head(5)
-        for _, r in top_campaigns.iterrows():
-            lines.append(
-                f"- {r['campaign']}: 花费 {r['cost']:.2f}，转化 {int(r['conversions'])}，"
-                f"收入 {r['revenue']:.2f}，ROAS {r['roas']:.2f}"
-            )
-        lines.append("")
-
-        lines.append("【4. 最近7天趋势】")
-        if len(trend) > 0:
-            for _, r in trend.iterrows():
-                lines.append(
-                    f"- {str(r['date'])[:10]}: 花费 {r['cost']:.2f}，收入 {r['revenue']:.2f}，"
-                    f"转化 {int(r['conversions'])}，ROAS {r['roas']:.2f}"
-                )
+    def _calculate_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "impressions" in df.columns and "clicks" in df.columns:
+            df["CTR"] = safe_divide(df["clicks"], df["impressions"]) * 100
         else:
-            lines.append("- 无近7天数据")
-        lines.append("")
+            df["CTR"] = 0
 
-        lines.append("【5. 低效投放预警】")
-        if len(anomalies) == 0:
-            lines.append("- 暂未发现明显低效 Campaign")
+        if "cost" in df.columns and "clicks" in df.columns:
+            df["CPC"] = safe_divide(df["cost"], df["clicks"])
         else:
-            for _, r in anomalies.iterrows():
-                lines.append(
-                    f"- {r['campaign']}: 花费 {r['cost']:.2f}，点击 {int(r['clicks'])}，"
-                    f"转化 {int(r['conversions'])}，CPA {r['cpa']:.2f}，ROAS {r['roas']:.2f}"
-                )
+            df["CPC"] = 0
 
-        return "\n".join(lines)
+        if "conversions" in df.columns and "clicks" in df.columns:
+            df["CVR"] = safe_divide(df["conversions"], df["clicks"]) * 100
+        else:
+            df["CVR"] = 0
 
-    # ----------------------------
-    # 分组分析
-    # ----------------------------
-    def group_analysis(self, dim="channel"):
-        if dim not in ["channel", "campaign"]:
-            raise ValueError("dim 仅支持 channel 或 campaign")
+        if "cost" in df.columns and "conversions" in df.columns:
+            df["CPA"] = safe_divide(df["cost"], df["conversions"])
+        else:
+            df["CPA"] = 0
 
-        sql = f"""
-        SELECT
-            {dim},
-            SUM(impressions) AS impressions,
-            SUM(clicks) AS clicks,
-            SUM(cost) AS cost,
-            SUM(conversions) AS conversions,
-            SUM(revenue) AS revenue,
-            CASE WHEN SUM(impressions) > 0 THEN SUM(clicks) * 1.0 / SUM(impressions) ELSE 0 END AS ctr,
-            CASE WHEN SUM(clicks) > 0 THEN SUM(cost) * 1.0 / SUM(clicks) ELSE 0 END AS cpc,
-            CASE WHEN SUM(clicks) > 0 THEN SUM(conversions) * 1.0 / SUM(clicks) ELSE 0 END AS cvr,
-            CASE WHEN SUM(conversions) > 0 THEN SUM(cost) * 1.0 / SUM(conversions) ELSE 0 END AS cpa,
-            CASE WHEN SUM(cost) > 0 THEN SUM(revenue) * 1.0 / SUM(cost) ELSE 0 END AS roas
-        FROM marketing_data
-        GROUP BY 1
-        ORDER BY revenue DESC
-        """
-        return self.conn.execute(sql).df()
+        if "revenue" in df.columns and "cost" in df.columns:
+            df["ROAS"] = safe_divide(df["revenue"], df["cost"])
+        else:
+            df["ROAS"] = 0
 
-    # ----------------------------
-    # 趋势分析
-    # ----------------------------
-    def daily_trend(self, last_n=7):
-        max_date = self.df["date"].max()
-        min_date = max_date - pd.Timedelta(days=last_n - 1)
+        return df
 
-        sql = f"""
-        SELECT
-            date::DATE AS date,
-            SUM(impressions) AS impressions,
-            SUM(clicks) AS clicks,
-            SUM(cost) AS cost,
-            SUM(conversions) AS conversions,
-            SUM(revenue) AS revenue,
-            CASE WHEN SUM(cost) > 0 THEN SUM(revenue) * 1.0 / SUM(cost) ELSE 0 END AS roas
-        FROM marketing_data
-        WHERE date >= '{min_date.strftime("%Y-%m-%d")}'
-        GROUP BY 1
-        ORDER BY 1
-        """
-        return self.conn.execute(sql).df()
+    def get_overview_metrics(self, df: pd.DataFrame) -> Dict:
+        metrics = {}
 
-    # ----------------------------
-    # 异常/低效识别
-    # ----------------------------
-    def find_inefficient_campaigns(self):
-        campaign_df = self.group_analysis("campaign")
-        if len(campaign_df) == 0:
-            return campaign_df
+        metrics["总曝光"] = df["impressions"].sum() if "impressions" in df.columns else 0
+        metrics["总点击"] = df["clicks"].sum() if "clicks" in df.columns else 0
+        metrics["总花费"] = df["cost"].sum() if "cost" in df.columns else 0
+        metrics["总转化"] = df["conversions"].sum() if "conversions" in df.columns else 0
+        metrics["总收入"] = df["revenue"].sum() if "revenue" in df.columns else 0
 
-        # 简单规则：花费高于中位数，且ROAS<1 或 CVR低于中位数
-        cost_median = campaign_df["cost"].median()
-        cvr_median = campaign_df["cvr"].median()
-
-        res = campaign_df[
-            (campaign_df["cost"] >= cost_median) &
-            ((campaign_df["roas"] < 1.0) | (campaign_df["cvr"] < cvr_median))
-        ].sort_values(["cost", "roas"], ascending=[False, True])
-
-        return res.head(10)
-
-    # ----------------------------
-    # 自然语言查询
-    # ----------------------------
-    def ask(self, question: str):
-        q = question.strip().lower()
-
-        if any(k in q for k in ["整体", "总体", "总览", "概览", "summary"]):
-            return self.answer_overall()
-
-        if "按渠道" in q or ("渠道" in q and "分析" in q):
-            return self.answer_channel_analysis()
-
-        if "按campaign" in q or "按广告系列" in q or ("campaign" in q and "分析" in q):
-            return self.answer_campaign_analysis()
-
-        if "最近7天" in q or "近7天" in q or "趋势" in q:
-            return self.answer_trend()
-
-        if "低效" in q or "花钱多但转化低" in q or "异常" in q:
-            return self.answer_inefficient()
-
-        # top n roas
-        top_match = re.search(r"roas最高的?(\d+)?", q)
-        if top_match:
-            n = top_match.group(1)
-            n = int(n) if n else 5
-            return self.answer_top_roas(n=n)
-
-        # top n revenue
-        top_rev = re.search(r"(收入|revenue)最高的?(\d+)?", q)
-        if top_rev:
-            n = top_rev.group(2)
-            n = int(n) if n else 5
-            return self.answer_top_revenue(n=n)
-
-        if "sql" in q:
-            return self.example_sql()
-
-        return (
-            "我目前支持这些问题：\n"
-            "1. 整体表现怎么样\n"
-            "2. 按渠道分析\n"
-            "3. 按Campaign分析\n"
-            "4. 最近7天趋势\n"
-            "5. ROAS最高的5个Campaign\n"
-            "6. 收入最高的5个Campaign\n"
-            "7. 哪些Campaign花钱多但转化低\n"
-            "8. 给我SQL示例\n"
+        metrics["CTR"] = (
+            metrics["总点击"] / metrics["总曝光"] * 100
+            if metrics["总曝光"] > 0 else 0
+        )
+        metrics["CPC"] = (
+            metrics["总花费"] / metrics["总点击"]
+            if metrics["总点击"] > 0 else 0
+        )
+        metrics["CVR"] = (
+            metrics["总转化"] / metrics["总点击"] * 100
+            if metrics["总点击"] > 0 else 0
+        )
+        metrics["CPA"] = (
+            metrics["总花费"] / metrics["总转化"]
+            if metrics["总转化"] > 0 else 0
+        )
+        metrics["ROAS"] = (
+            metrics["总收入"] / metrics["总花费"]
+            if metrics["总花费"] > 0 else 0
         )
 
-    def answer_overall(self):
-        s = self.overall_summary()
-        return (
-            "【整体表现】\n"
-            f"总曝光: {s['总曝光']}\n"
-            f"总点击: {s['总点击']}\n"
-            f"总花费: {s['总花费']:.2f}\n"
-            f"总转化: {s['总转化']}\n"
-            f"总收入: {s['总收入']:.2f}\n"
-            f"CTR: {self.fmt_pct(s['CTR'])}\n"
-            f"CPC: {s['CPC']:.2f}\n"
-            f"CVR: {self.fmt_pct(s['CVR'])}\n"
-            f"CPA: {s['CPA']:.2f}\n"
-            f"ROAS: {s['ROAS']:.2f}\n"
+        return metrics
+
+    def analyze_by_channel(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "channel" not in df.columns:
+            return pd.DataFrame()
+
+        grouped = df.groupby("channel", as_index=False).agg({
+            "impressions": "sum" if "impressions" in df.columns else "count",
+            "clicks": "sum" if "clicks" in df.columns else "count",
+            "cost": "sum" if "cost" in df.columns else "count",
+            "conversions": "sum" if "conversions" in df.columns else "count",
+            "revenue": "sum" if "revenue" in df.columns else "count"
+        })
+
+        grouped["CTR"] = safe_divide(grouped["clicks"], grouped["impressions"]) * 100
+        grouped["CPC"] = safe_divide(grouped["cost"], grouped["clicks"])
+        grouped["CVR"] = safe_divide(grouped["conversions"], grouped["clicks"]) * 100
+        grouped["CPA"] = safe_divide(grouped["cost"], grouped["conversions"])
+        grouped["ROAS"] = safe_divide(grouped["revenue"], grouped["cost"])
+
+        return grouped.sort_values("cost", ascending=False)
+
+    def analyze_by_campaign(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "campaign" not in df.columns:
+            return pd.DataFrame()
+
+        grouped = df.groupby("campaign", as_index=False).agg({
+            "impressions": "sum" if "impressions" in df.columns else "count",
+            "clicks": "sum" if "clicks" in df.columns else "count",
+            "cost": "sum" if "cost" in df.columns else "count",
+            "conversions": "sum" if "conversions" in df.columns else "count",
+            "revenue": "sum" if "revenue" in df.columns else "count"
+        })
+
+        grouped["CTR"] = safe_divide(grouped["clicks"], grouped["impressions"]) * 100
+        grouped["CPC"] = safe_divide(grouped["cost"], grouped["clicks"])
+        grouped["CVR"] = safe_divide(grouped["conversions"], grouped["clicks"]) * 100
+        grouped["CPA"] = safe_divide(grouped["cost"], grouped["conversions"])
+        grouped["ROAS"] = safe_divide(grouped["revenue"], grouped["cost"])
+
+        return grouped.sort_values("cost", ascending=False)
+
+    def analyze_trend(self, df: pd.DataFrame) -> pd.DataFrame:
+        if "date" not in df.columns:
+            return pd.DataFrame()
+
+        grouped = df.groupby("date", as_index=False).agg({
+            "impressions": "sum" if "impressions" in df.columns else "count",
+            "clicks": "sum" if "clicks" in df.columns else "count",
+            "cost": "sum" if "cost" in df.columns else "count",
+            "conversions": "sum" if "conversions" in df.columns else "count",
+            "revenue": "sum" if "revenue" in df.columns else "count"
+        })
+
+        grouped["CTR"] = safe_divide(grouped["clicks"], grouped["impressions"]) * 100
+        grouped["CPC"] = safe_divide(grouped["cost"], grouped["clicks"])
+        grouped["CVR"] = safe_divide(grouped["conversions"], grouped["clicks"]) * 100
+        grouped["CPA"] = safe_divide(grouped["cost"], grouped["conversions"])
+        grouped["ROAS"] = safe_divide(grouped["revenue"], grouped["cost"])
+
+        return grouped.sort_values("date")
+
+    def identify_low_efficiency(self, df: pd.DataFrame) -> pd.DataFrame:
+        result = self.analyze_by_campaign(df)
+        if result.empty:
+            return result
+
+        # 规则：花费高于中位数 且 ROAS 低于中位数
+        cost_median = result["cost"].median() if "cost" in result.columns else 0
+        roas_median = result["ROAS"].median() if "ROAS" in result.columns else 0
+
+        low_eff = result[
+            (result["cost"] >= cost_median) &
+            (result["ROAS"] <= roas_median)
+        ].copy()
+
+        return low_eff.sort_values(["ROAS", "cost"], ascending=[True, False])
+
+    def answer_question(self, question: str, df: pd.DataFrame) -> str:
+        q = question.lower()
+
+        overview = self.get_overview_metrics(df)
+
+        if any(k in q for k in ["整体", "总览", "概览", "summary", "overview"]):
+            return (
+                f"整体表现：总花费 {overview['总花费']:.2f}，"
+                f"总收入 {overview['总收入']:.2f}，"
+                f"ROAS {overview['ROAS']:.2f}，"
+                f"CTR {overview['CTR']:.2f}%，"
+                f"CVR {overview['CVR']:.2f}%。"
+            )
+
+        if any(k in q for k in ["渠道", "channel"]):
+            channel_df = self.analyze_by_channel(df)
+            if channel_df.empty:
+                return "数据中没有 channel/渠道 字段。"
+            top = channel_df.iloc[0]
+            return (
+                f"花费最高的渠道是 {top['channel']}，"
+                f"花费 {top['cost']:.2f}，ROAS {top['ROAS']:.2f}，"
+                f"CTR {top['CTR']:.2f}%，CVR {top['CVR']:.2f}%。"
+            )
+
+        if any(k in q for k in ["campaign", "计划", "活动"]):
+            camp_df = self.analyze_by_campaign(df)
+            if camp_df.empty:
+                return "数据中没有 campaign/计划 字段。"
+            top = camp_df.sort_values("ROAS", ascending=False).iloc[0]
+            return (
+                f"ROAS 最好的 Campaign 是 {top['campaign']}，"
+                f"花费 {top['cost']:.2f}，收入 {top['revenue']:.2f}，ROAS {top['ROAS']:.2f}。"
+            )
+
+        if any(k in q for k in ["趋势", "trend", "最近", "按天"]):
+            trend_df = self.analyze_trend(df)
+            if trend_df.empty:
+                return "数据中没有 date/日期 字段。"
+            latest = trend_df.iloc[-1]
+            return (
+                f"最近一天表现：日期 {latest['date'].date()}，"
+                f"花费 {latest['cost']:.2f}，收入 {latest['revenue']:.2f}，ROAS {latest['ROAS']:.2f}。"
+            )
+
+        if any(k in q for k in ["低效", "浪费", "优化"]):
+            low_df = self.identify_low_efficiency(df)
+            if low_df.empty:
+                return "未识别到明显低效投放项，或缺少 campaign 字段。"
+            top = low_df.iloc[0]
+            return (
+                f"建议优先优化 Campaign：{top['campaign']}，"
+                f"花费 {top['cost']:.2f}，ROAS {top['ROAS']:.2f}，CPA {top['CPA']:.2f}。"
+            )
+
+        return "我支持的问题包括：整体概览、渠道分析、Campaign 分析、趋势分析、低效投放识别。"
+
+# =========================
+# Streamlit 页面
+# =========================
+agent = MarketingDataAgent()
+
+st.title("营销数据分析 Agent（Streamlit 可视化完整版）")
+st.caption("上传营销数据文件，自动完成清洗、指标计算、可视化分析和问答。")
+
+with st.sidebar:
+    st.header("上传数据")
+    uploaded_file = st.file_uploader("支持 CSV / Excel", type=["csv", "xlsx", "xls"])
+
+    st.markdown("### 示例字段")
+    st.write("""
+    可识别字段：
+    - 日期 / date
+    - 渠道 / channel
+    - 计划 / campaign
+    - 曝光 / impressions
+    - 点击 / clicks
+    - 花费 / cost
+    - 转化 / conversions
+    - 收入 / revenue
+    """)
+
+if uploaded_file is not None:
+    try:
+        df = agent.load_data(uploaded_file)
+
+        st.success("数据加载成功")
+
+        # 数据过滤
+        st.subheader("数据筛选")
+        col_f1, col_f2, col_f3 = st.columns(3)
+
+        filtered_df = df.copy()
+
+        with col_f1:
+            if "date" in filtered_df.columns and filtered_df["date"].notna().sum() > 0:
+                min_date = filtered_df["date"].min().date()
+                max_date = filtered_df["date"].max().date()
+                date_range = st.date_input("日期范围", [min_date, max_date])
+                if len(date_range) == 2:
+                    start_date, end_date = date_range
+                    filtered_df = filtered_df[
+                        (filtered_df["date"].dt.date >= start_date) &
+                        (filtered_df["date"].dt.date <= end_date)
+                    ]
+
+        with col_f2:
+            if "channel" in filtered_df.columns:
+                channels = ["全部"] + sorted(filtered_df["channel"].dropna().unique().tolist())
+                selected_channel = st.selectbox("选择渠道", channels)
+                if selected_channel != "全部":
+                    filtered_df = filtered_df[filtered_df["channel"] == selected_channel]
+
+        with col_f3:
+            if "campaign" in filtered_df.columns:
+                campaigns = ["全部"] + sorted(filtered_df["campaign"].dropna().unique().tolist())
+                selected_campaign = st.selectbox("选择 Campaign", campaigns)
+                if selected_campaign != "全部":
+                    filtered_df = filtered_df[filtered_df["campaign"] == selected_campaign]
+
+        # 概览指标
+        st.subheader("核心指标概览")
+        metrics = agent.get_overview_metrics(filtered_df)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("总花费", f"{metrics['总花费']:.2f}")
+        c2.metric("总收入", f"{metrics['总收入']:.2f}")
+        c3.metric("ROAS", f"{metrics['ROAS']:.2f}")
+        c4.metric("CTR", f"{metrics['CTR']:.2f}%")
+        c5.metric("CVR", f"{metrics['CVR']:.2f}%")
+
+        c6, c7, c8, c9, c10 = st.columns(5)
+        c6.metric("总曝光", f"{int(metrics['总曝光'])}")
+        c7.metric("总点击", f"{int(metrics['总点击'])}")
+        c8.metric("总转化", f"{int(metrics['总转化'])}")
+        c9.metric("CPC", f"{metrics['CPC']:.2f}")
+        c10.metric("CPA", f"{metrics['CPA']:.2f}")
+
+        # Tabs
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+            ["数据预览", "渠道分析", "Campaign 分析", "趋势分析", "低效投放", "智能问答"]
         )
 
-    def answer_channel_analysis(self):
-        df = self.group_analysis("channel")
-        return "【按渠道分析】\n" + tabulate(
-            self.pretty_metric_df(df, "channel"),
-            headers="keys",
-            tablefmt="grid",
-            showindex=False
-        )
+        with tab1:
+            st.subheader("数据预览")
+            st.dataframe(filtered_df, use_container_width=True)
 
-    def answer_campaign_analysis(self):
-        df = self.group_analysis("campaign").head(20)
-        return "【按Campaign分析（前20）】\n" + tabulate(
-            self.pretty_metric_df(df, "campaign"),
-            headers="keys",
-            tablefmt="grid",
-            showindex=False
-        )
+        with tab2:
+            st.subheader("渠道分析")
+            channel_df = agent.analyze_by_channel(filtered_df)
 
-    def answer_trend(self):
-        df = self.daily_trend(7)
-        if len(df) == 0:
-            return "最近7天没有数据"
-        return "【最近7天趋势】\n" + tabulate(
-            self.pretty_trend_df(df),
-            headers="keys",
-            tablefmt="grid",
-            showindex=False
-        )
-
-    def answer_inefficient(self):
-        df = self.find_inefficient_campaigns()
-        if len(df) == 0:
-            return "未发现明显低效 Campaign"
-        return "【低效Campaign预警】\n" + tabulate(
-            self.pretty_metric_df(df, "campaign"),
-            headers="keys",
-            tablefmt="grid",
-            showindex=False
-        )
-
-    def answer_top_roas(self, n=5):
-        df = self.group_analysis("campaign").sort_values("roas", ascending=False).head(n)
-        return f"【ROAS最高的{n}个Campaign】\n" + tabulate(
-            self.pretty_metric_df(df, "campaign"),
-            headers="keys",
-            tablefmt="grid",
-            showindex=False
-        )
-
-    def answer_top_revenue(self, n=5):
-        df = self.group_analysis("campaign").sort_values("revenue", ascending=False).head(n)
-        return f"【收入最高的{n}个Campaign】\n" + tabulate(
-            self.pretty_metric_df(df, "campaign"),
-            headers="keys",
-            tablefmt="grid",
-            showindex=False
-        )
-
-    def example_sql(self):
-        return """
-【SQL 示例】
-
-1) 按渠道汇总
-SELECT
-  channel,
-  SUM(cost) AS cost,
-  SUM(revenue) AS revenue,
-  SUM(revenue) / NULLIF(SUM(cost), 0) AS roas
-FROM marketing_data
-GROUP BY channel
-ORDER BY revenue DESC;
-
-2) 找出 ROAS 最高的 Campaign
-SELECT
-  campaign,
-  SUM(cost) AS cost,
-  SUM(revenue) AS revenue,
-  SUM(revenue) / NULLIF(SUM(cost), 0) AS roas
-FROM marketing_data
-GROUP BY campaign
-ORDER BY roas DESC
-LIMIT 5;
-
-3) 最近7天趋势
-SELECT
-  date::DATE AS date,
-  SUM(cost) AS cost,
-  SUM(revenue) AS revenue,
-  SUM(conversions) AS conversions
-FROM marketing_data
-GROUP BY 1
-ORDER BY 1 DESC
-LIMIT 7;
-        """.strip()
-
-    # ----------------------------
-    # 展示格式处理
-    # ----------------------------
-    def pretty_metric_df(self, df, dim_col):
-        x = df.copy()
-        for c in ["cost", "revenue", "cpc", "cpa", "roas"]:
-            if c in x.columns:
-                x[c] = x[c].map(lambda v: round(float(v), 2))
-        for c in ["ctr", "cvr"]:
-            if c in x.columns:
-                x[c] = x[c].map(lambda v: f"{float(v) * 100:.2f}%")
-        for c in ["impressions", "clicks", "conversions"]:
-            if c in x.columns:
-                x[c] = x[c].astype(int)
-        cols = [dim_col, "impressions", "clicks", "cost", "conversions", "revenue", "ctr", "cvr", "cpa", "roas"]
-        cols = [c for c in cols if c in x.columns]
-        return x[cols]
-
-    def pretty_trend_df(self, df):
-        x = df.copy()
-        x["date"] = x["date"].astype(str)
-        for c in ["cost", "revenue", "roas"]:
-            x[c] = x[c].map(lambda v: round(float(v), 2))
-        for c in ["impressions", "clicks", "conversions"]:
-            x[c] = x[c].astype(int)
-        return x[["date", "impressions", "clicks", "cost", "conversions", "revenue", "roas"]]
-
-    # ----------------------------
-    # 交互
-    # ----------------------------
-    def interactive(self):
-        print("\n营销数据分析 Agent 已启动")
-        print("输入你的问题，例如：")
-        print("- 整体表现怎么样")
-        print("- 按渠道分析")
-        print("- ROAS最高的5个Campaign")
-        print("- 最近7天趋势")
-        print("- 哪些Campaign花钱多但转化低")
-        print("- report 生成完整报告")
-        print("- exit 退出\n")
-
-        while True:
-            q = input("你：").strip()
-            if q.lower() in ["exit", "quit", "q"]:
-                print("Agent：再见")
-                break
-            elif q.lower() == "report":
-                print(self.generate_report())
+            if channel_df.empty:
+                st.info("缺少 channel/渠道 字段")
             else:
-                print(self.ask(q))
-                print("")
+                st.dataframe(channel_df, use_container_width=True)
 
+                col1, col2 = st.columns(2)
 
-def main():
-    parser = argparse.ArgumentParser(description="营销数据分析 Agent")
-    parser.add_argument("--file", required=True, help="营销CSV文件路径")
-    parser.add_argument("--report", action="store_true", help="直接输出完整报告")
-    args = parser.parse_args()
+                with col1:
+                    fig_cost = px.bar(
+                        channel_df,
+                        x="channel",
+                        y="cost",
+                        title="各渠道花费对比",
+                        text_auto=True
+                    )
+                    st.plotly_chart(fig_cost, use_container_width=True)
 
-    agent = MarketingDataAgent(args.file)
+                with col2:
+                    fig_roas = px.bar(
+                        channel_df,
+                        x="channel",
+                        y="ROAS",
+                        title="各渠道 ROAS 对比",
+                        text_auto=True
+                    )
+                    st.plotly_chart(fig_roas, use_container_width=True)
 
-    if args.report:
-        print(agent.generate_report())
-    else:
-        agent.interactive()
+        with tab3:
+            st.subheader("Campaign 分析")
+            campaign_df = agent.analyze_by_campaign(filtered_df)
 
+            if campaign_df.empty:
+                st.info("缺少 campaign/计划 字段")
+            else:
+                st.dataframe(campaign_df, use_container_width=True)
 
-if __name__ == "__main__":
-    main()
+                top_n = st.slider("查看前 N 个 Campaign（按花费）", 5, 30, 10)
+                top_campaign_df = campaign_df.head(top_n)
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    fig_camp_cost = px.bar(
+                        top_campaign_df,
+                        x="campaign",
+                        y="cost",
+                        title=f"Top {top_n} Campaign 花费",
+                        text_auto=True
+                    )
+                    fig_camp_cost.update_layout(xaxis_tickangle=-45)
+                    st.plotly_chart(fig_camp_cost, use_container_width=True)
+
+                with col2:
+                    fig_camp_roas = px.bar(
+                        top_campaign_df.sort_values("ROAS", ascending=False),
+                        x="campaign",
+                        y="ROAS",
+                        title=f"Top {top_n} Campaign ROAS",
+                        text_auto=True
+                    )
+                    fig_camp_roas.update_layout(xaxis_tickangle=-45)
+                    st.plotly_chart(fig_camp_roas, use_container_width=True)
+
+        with tab4:
+            st.subheader("趋势分析")
+            trend_df = agent.analyze_trend(filtered_df)
+
+            if trend_df.empty:
+                st.info("缺少 date/日期 字段")
+            else:
+                metric_option = st.selectbox(
+                    "选择趋势指标",
+                    ["cost", "revenue", "clicks", "conversions", "CTR", "CVR", "ROAS"]
+                )
+
+                fig_trend = px.line(
+                    trend_df,
+                    x="date",
+                    y=metric_option,
+                    title=f"{metric_option} 趋势图",
+                    markers=True
+                )
+                st.plotly_chart(fig_trend, use_container_width=True)
+
+                st.dataframe(trend_df, use_container_width=True)
+
+        with tab5:
+            st.subheader("低效投放识别")
+            low_df = agent.identify_low_efficiency(filtered_df)
+
+            if low_df.empty:
+                st.info("未识别到低效项，或缺少 campaign 字段。")
+            else:
+                st.warning("以下 Campaign 可能存在高花费低回报问题：")
+                st.dataframe(low_df, use_container_width=True)
+
+                fig_low = px.scatter(
+                    low_df,
+                    x="cost",
+                    y="ROAS",
+                    size="conversions" if "conversions" in low_df.columns else None,
+                    hover_name="campaign",
+                    title="低效 Campaign 分布图"
+                )
+                st.plotly_chart(fig_low, use_container_width=True)
+
+        with tab6:
+            st.subheader("智能问答")
+            st.write("示例问题：")
+            st.write("- 整体表现怎么样？")
+            st.write("- 渠道表现如何？")
+            st.write("- 哪个 Campaign 最好？")
+            st.write("- 最近趋势怎么样？")
+            st.write("- 哪些投放需要优化？")
+
+            user_question = st.text_input("请输入你的问题")
+            if st.button("开始分析"):
+                if user_question.strip():
+                    answer = agent.answer_question(user_question, filtered_df)
+                    st.success(answer)
+                else:
+                    st.warning("请输入问题")
+
+    except Exception as e:
+        st.error(f"数据处理失败：{e}")
+else:
+    st.info("请先在左侧上传营销数据文件。")
